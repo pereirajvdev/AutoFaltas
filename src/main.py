@@ -3,6 +3,8 @@ import time
 from pathlib import Path
 
 import pandas as pd
+import pyperclip
+
 from pywinauto import Desktop
 
 
@@ -10,8 +12,6 @@ TITULO_JANELA = (
     "Gerador de Relatórios "
     "( Versão: 4.0 ) - Recursos Humanos e Folha de Pagamento"
 )
-
-HANDLE_MATRICULA = 330106
 
 
 def ler_planilha(caminho):
@@ -49,42 +49,136 @@ def obter_janela():
     return janela
 
 
+def encontrar_campo_funcionario(janela):
+    abas = janela.descendants(
+        class_name="TcxTabSheet"
+    )
+
+    for aba in abas:
+        try:
+            if aba.window_text() != "Funcionário":
+                continue
+
+            combos = aba.descendants(
+                class_name="TelLookupCombo"
+            )
+
+            if combos:
+                return combos[0]
+
+        except Exception:
+            pass
+
+    return None
+
+
+def encontrar_campo_lancamento(janela):
+    abas = janela.descendants(
+        class_name="TcxTabSheet"
+    )
+
+    # Primeiro encontramos a aba Funcionário
+    aba_funcionario = None
+
+    for aba in abas:
+        try:
+            if aba.window_text() == "Funcionário":
+                aba_funcionario = aba
+                break
+        except Exception:
+            pass
+
+    # Procuramos todos os TelLookupCombo da janela
+    combos = janela.descendants(
+        class_name="TelLookupCombo"
+    )
+
+    for combo in combos:
+        try:
+            # Se o combo estiver dentro da aba Funcionário,
+            # não é o campo de lançamento.
+            if aba_funcionario is not None:
+                try:
+                    if combo.is_child(aba_funcionario):
+                        continue
+                except Exception:
+                    pass
+
+            # Verificamos o painel pai imediato
+            pais = combo.parent()
+
+            if pais is not None:
+                combos_pai = pais.descendants(
+                    class_name="TelLookupCombo"
+                )
+
+                if len(combos_pai) == 1:
+                    return combo
+
+        except Exception:
+            pass
+
+    return None
+
+
 def preencher_matricula(matricula):
     janela = obter_janela()
 
-    controle = janela.child_window(
-        handle=HANDLE_MATRICULA
-    )
+    controle = encontrar_campo_funcionario(janela)
 
-    if not controle.exists(timeout=2):
+    if controle is None:
         raise RuntimeError(
-            f"Controle da matrícula não encontrado. "
-            f"Handle: {HANDLE_MATRICULA}"
+            "Campo de matrícula não encontrado."
         )
 
-    print(f"Preenchendo matrícula: {matricula}")
+    print(
+        f"Preenchendo matrícula {matricula} "
+        f"(handle atual: {controle.handle})"
+    )
 
     controle.set_focus()
+
+    pyperclip.copy(str(matricula))
+
     controle.type_keys("^a")
-    controle.type_keys(str(matricula))
+    controle.type_keys("^v")
+
+
+def preencher_lancamento(valor):
+    janela = obter_janela()
+
+    controle = encontrar_campo_lancamento(janela)
+
+    if controle is None:
+        raise RuntimeError(
+            "Campo de lançamento não encontrado."
+        )
 
     print(
-        "Valor no campo:",
-        repr(controle.window_text())
+        f"Preenchendo lançamento {valor} "
+        f"(handle atual: {controle.handle})"
     )
+
+    controle.set_focus()
+
+    pyperclip.copy(str(valor))
+
+    controle.type_keys("^a")
+    controle.type_keys("^v")
 
 
 def pressionar_enter():
     janela = obter_janela()
 
-    controle = janela.child_window(
-        handle=HANDLE_MATRICULA
-    )
+    controle = encontrar_campo_funcionario(janela)
+
+    if controle is None:
+        raise RuntimeError(
+            "Campo de matrícula não encontrado."
+        )
 
     controle.set_focus()
     controle.type_keys("{ENTER}")
-
-    print("Enter pressionado.")
 
 
 def processar_planilha(caminho):
@@ -125,6 +219,10 @@ def main():
             f"O caminho informado não é um arquivo: {args.planilha}"
         )
 
+    # Teste inicial
+    preencher_lancamento("682")
+
+    # Depois do teste, processa a planilha
     processar_planilha(args.planilha)
 
 
