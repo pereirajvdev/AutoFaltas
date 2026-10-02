@@ -14,8 +14,6 @@ TITULO_JANELA = (
     "( Versão: 4.0 ) - Recursos Humanos e Folha de Pagamento"
 )
 
-CODIGO_LANCAMENTO = "682"
-
 
 def ler_planilha(caminho):
     df = pd.read_excel(caminho)
@@ -239,7 +237,7 @@ def get_screen_name():
     return "Desconhecida"
 
 
-def processar_resultado(caminho_planilha, ano):
+def processar_resultado(caminho_planilha, ano, codigo_lancamento):
     print("Aguardando resultado...")
 
     while True:
@@ -252,7 +250,8 @@ def processar_resultado(caminho_planilha, ano):
 
             salvo = imprimir_como_pdf(
                 caminho_planilha,
-                ano
+                ano,
+                codigo_lancamento
             )
 
             if salvo:
@@ -274,7 +273,7 @@ def clicar_botao_preview():
     print("Botão clicado.")
 
 
-def imprimir_como_pdf(caminho_planilha, ano):
+def imprimir_como_pdf(caminho_planilha, ano, codigo_lancamento):
     desktop = Desktop(backend="win32")
 
     print("Aguardando janela de impressão...")
@@ -355,11 +354,12 @@ def imprimir_como_pdf(caminho_planilha, ano):
 
     return salvar_pdf(
         caminho_planilha,
-        ano
+        ano,
+        codigo_lancamento
     )
 
 
-def salvar_pdf(caminho_planilha, ano):
+def salvar_pdf(caminho_planilha, ano, codigo_lancamento):
     desktop = Desktop(backend="win32")
 
     print("Aguardando janela para salvar PDF...")
@@ -387,7 +387,7 @@ def salvar_pdf(caminho_planilha, ano):
     pasta_saida = caminho_planilha.parent
 
     nome_arquivo = (
-        f"FALTAS {CODIGO_LANCAMENTO} {ano}.pdf"
+        f"FALTAS {codigo_lancamento} {ano}.pdf"
     )
 
     caminho_pdf = pasta_saida / nome_arquivo
@@ -552,25 +552,26 @@ def selecionar_funcionarios(dados):
         time.sleep(0.3)
 
 
-def processar_anos(caminho_planilha, inicio_ano, fim_ano):
+def processar_anos(caminho_planilha, inicio_ano, fim_ano, codigo_lancamento):
     for ano in range(inicio_ano, fim_ano + 1):
 
         print()
         print("=" * 50)
-        print(f"PROCESSANDO ANO {ano}")
+        print(f"PROCESSANDO ANO {ano} - LANÇAMENTO {codigo_lancamento}")
         print("=" * 50)
 
         preencher_ano(ano)
 
         preencher_lancamento(
-            CODIGO_LANCAMENTO
+            codigo_lancamento
         )
 
         clicar_ok()
 
         processar_resultado(
             caminho_planilha,
-            ano
+            ano,
+            codigo_lancamento
         )
 
 
@@ -623,11 +624,19 @@ def main():
     selecionar_funcionarios(dados)
 
     # Processa todos os anos
-    processar_anos(
-        args.planilha,
-        inicio_ano,
-        fim_ano
-    )
+    for codigo_lancamento in ["682", "619"]:
+
+        print()
+        print("#" * 60)
+        print(f"INICIANDO LANÇAMENTO {codigo_lancamento}")
+        print("#" * 60)
+
+        processar_anos(
+            args.planilha,
+            inicio_ano,
+            fim_ano,
+            codigo_lancamento
+        )
 
 
 if __name__ == "__main__":
