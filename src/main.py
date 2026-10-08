@@ -27,12 +27,16 @@ def ler_planilha(caminho):
 
     for _, linha in df.iterrows():
         matricula = str(linha.iloc[0]).strip()
-        nome = str(linha.iloc[1]).strip()
+        if matricula[-2] == ".": matricula = matricula[:-2]
+        print("\n\nta sendo lido assim "+matricula+"\n\n")
+        if matricula != "nan":
+            
+            nome = str(linha.iloc[1]).strip()
 
-        if not matricula:
-            continue
+            if not matricula:
+                continue
 
-        dados.append((matricula, nome))
+            dados.append((matricula, nome))
 
     return dados
 
@@ -246,6 +250,28 @@ def processar_resultado(caminho_planilha, ano, codigo_lancamento):
         if tela_atual == "Preview":
             print("Relatório aberto no preview.")
 
+            # Localiza e guarda a janela do preview
+            desktop = Desktop(backend="win32")
+            preview = None
+
+            try:
+                for janela in desktop.windows():
+                    try:
+                        if (
+                            janela.window_text()
+                            == "Lancamentos_Especificos__por_Ano"
+                            and janela.class_name() == "TfrmPreview"
+                        ):
+                            preview = janela
+                            break
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+            if preview is None:
+                print("Não foi possível obter a janela do preview.")
+
             clicar_botao_preview()
 
             salvo = imprimir_como_pdf(
@@ -254,8 +280,33 @@ def processar_resultado(caminho_planilha, ano, codigo_lancamento):
                 codigo_lancamento
             )
 
-            if salvo:
-                fechar_preview()
+            if salvo and preview is not None:
+                print("Fechando preview...")
+
+                try:
+                    preview.close()
+                    time.sleep(0.5)
+                except Exception as e:
+                    print(
+                        f"Falha ao fechar normalmente: {e}"
+                    )
+
+                # Verifica se ainda está aberto
+                try:
+                    if preview.exists():
+                        print(
+                            "Preview ainda aberto. "
+                            "Forçando fechamento..."
+                        )
+
+                        preview.kill()
+
+                        time.sleep(0.5)
+
+                except Exception:
+                    pass
+
+                print("Preview fechado.")
 
             return salvo
 
@@ -452,7 +503,13 @@ def salvar_pdf(caminho_planilha, ano, codigo_lancamento):
 def fechar_preview():
     desktop = Desktop(backend="win32")
 
-    for janela in desktop.windows():
+    try:
+        janelas = desktop.windows()
+    except Exception:
+        print("Não foi possível listar as janelas no momento.")
+        return False
+
+    for janela in janelas:
         try:
             if (
                 janela.window_text()
@@ -472,7 +529,8 @@ def fechar_preview():
                 return True
 
         except Exception:
-            pass
+            # Ignora janelas que foram destruídas durante a busca
+            continue
 
     print("Preview não encontrado para fechar.")
 
