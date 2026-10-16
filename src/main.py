@@ -26,17 +26,23 @@ def ler_planilha(caminho):
     dados = []
 
     for _, linha in df.iterrows():
+
         matricula = str(linha.iloc[0]).strip()
-        if matricula[-2] == ".": matricula = matricula[:-2]
-        print("\n\nta sendo lido assim "+matricula+"\n\n")
-        if matricula != "nan":
-            
-            nome = str(linha.iloc[1]).strip()
 
-            if not matricula:
-                continue
+        if matricula == "nan":
+            continue
 
-            dados.append((matricula, nome))
+        if matricula.endswith(".0"):
+            matricula = matricula[:-2]
+
+        nome = str(linha.iloc[1]).strip()
+
+        if not matricula:
+            continue
+
+        print(f"Matrícula lida: {matricula} - {nome}")
+
+        dados.append((matricula, nome))
 
     return dados
 
@@ -610,27 +616,66 @@ def selecionar_funcionarios(dados):
         time.sleep(0.3)
 
 
-def processar_anos(caminho_planilha, inicio_ano, fim_ano, codigo_lancamento):
+def processar_anos(
+    caminho_planilha,
+    inicio_ano,
+    fim_ano,
+    codigo_lancamento
+):
     for ano in range(inicio_ano, fim_ano + 1):
 
         print()
-        print("=" * 50)
-        print(f"PROCESSANDO ANO {ano} - LANÇAMENTO {codigo_lancamento}")
-        print("=" * 50)
+        print("=" * 60)
+        print(
+            f"PROCESSANDO ANO {ano} - "
+            f"LANÇAMENTO {codigo_lancamento}"
+        )
+        print("=" * 60)
 
         preencher_ano(ano)
 
-        preencher_lancamento(
-            codigo_lancamento
-        )
+        preencher_lancamento(codigo_lancamento)
 
         clicar_ok()
 
-        processar_resultado(
+        salvo = processar_resultado(
             caminho_planilha,
             ano,
             codigo_lancamento
         )
+
+        caminho_pdf = (
+            caminho_planilha.parent
+            / f"FALTAS {codigo_lancamento} {ano}.pdf"
+        )
+
+        if salvo:
+            if caminho_pdf.exists():
+                print()
+                print(
+                    f"[OK] PDF CONFIRMADO:"
+                )
+                print(caminho_pdf)
+                print(
+                    f"Tamanho: "
+                    f"{caminho_pdf.stat().st_size:,} bytes"
+                )
+            else:
+                print()
+                print(
+                    "[ERRO] O sistema informou que o PDF foi salvo,"
+                )
+                print(
+                    "mas o arquivo NÃO foi encontrado:"
+                )
+                print(caminho_pdf)
+
+        else:
+            print()
+            print(
+                f"[ERRO] Falha ao gerar "
+                f"FALTAS {codigo_lancamento} {ano}.pdf"
+            )
 
 
 def main():
