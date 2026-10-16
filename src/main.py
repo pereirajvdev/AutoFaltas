@@ -684,12 +684,6 @@ def main():
     )
 
     parser.add_argument(
-        "planilha",
-        type=Path,
-        help="Caminho da planilha Excel."
-    )
-
-    parser.add_argument(
         "anos",
         help=(
             "Intervalo de anos no formato YYYY-YYYY. "
@@ -697,17 +691,19 @@ def main():
         )
     )
 
+    parser.add_argument(
+        "--mat",
+        type=str,
+        help="Matrícula do funcionário a ser selecionado."
+    )
+
+    parser.add_argument(
+        "--planilha",
+        type=Path,
+        help="Caminho da planilha Excel com matrícula e nome."
+    )
+
     args = parser.parse_args()
-
-    if not args.planilha.exists():
-        parser.error(
-            f"Planilha não encontrada: {args.planilha}"
-        )
-
-    if not args.planilha.is_file():
-        parser.error(
-            f"O caminho informado não é um arquivo: {args.planilha}"
-        )
 
     try:
         inicio_ano, fim_ano = interpretar_intervalo_anos(
@@ -716,26 +712,41 @@ def main():
     except ValueError as erro:
         parser.error(str(erro))
 
-    print(
-        f"Período: {inicio_ano} até {fim_ano}"
-    )
+    print(f"Período: {inicio_ano} até {fim_ano}")
 
-    # Lê a planilha uma única vez
-    dados = ler_planilha(args.planilha)
+    # Seleciona os funcionários conforme os argumentos recebidos.
+    if args.mat:
+        dados = [(args.mat, "Matrícula informada manualmente")]
 
-    # Seleciona todos os funcionários uma única vez
+    elif args.planilha:
+        if not args.planilha.exists():
+            parser.error(
+                f"Planilha não encontrada: {args.planilha}"
+            )
+
+        if not args.planilha.is_file():
+            parser.error(
+                f"O caminho informado não é um arquivo: {args.planilha}"
+            )
+
+        dados = ler_planilha(args.planilha)
+
+    else:
+        parser.error(
+            "Informe --mat MATRICULA ou --planilha CAMINHO."
+        )
+
     selecionar_funcionarios(dados)
 
-    # Processa todos os anos
+    # Processa todos os anos para cada lançamento.
     for codigo_lancamento in ["682", "619"]:
-
         print()
         print("#" * 60)
         print(f"INICIANDO LANÇAMENTO {codigo_lancamento}")
         print("#" * 60)
 
         processar_anos(
-            args.planilha,
+            Path.cwd(),
             inicio_ano,
             fim_ano,
             codigo_lancamento
