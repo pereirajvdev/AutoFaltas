@@ -14,6 +14,10 @@ TITULO_JANELA = (
     "( Versão: 4.0 ) - Recursos Humanos e Folha de Pagamento"
 )
 
+DIRETORIO_SERVIDORES = Path(
+    r"C:\CAMINHO\PARA\Servidores"
+)
+
 
 def ler_planilha(caminho):
     df = pd.read_excel(caminho)
@@ -247,7 +251,12 @@ def get_screen_name():
     return "Desconhecida"
 
 
-def processar_resultado(caminho_planilha, ano, codigo_lancamento):
+def processar_resultado(
+    nome_funcionario,
+    ano,
+    codigo_lancamento,
+    pasta_saida,
+):
     print("Aguardando resultado...")
 
     while True:
@@ -281,9 +290,10 @@ def processar_resultado(caminho_planilha, ano, codigo_lancamento):
             clicar_botao_preview()
 
             salvo = imprimir_como_pdf(
-                caminho_planilha,
+                nome_funcionario,
                 ano,
-                codigo_lancamento
+                codigo_lancamento,
+                pasta_saida,
             )
 
             if salvo and preview is not None:
@@ -330,7 +340,12 @@ def clicar_botao_preview():
     print("Botão clicado.")
 
 
-def imprimir_como_pdf(caminho_planilha, ano, codigo_lancamento):
+def imprimir_como_pdf(
+    nome_funcionario,
+    ano,
+    codigo_lancamento,
+    pasta_saida,
+):
     desktop = Desktop(backend="win32")
 
     print("Aguardando janela de impressão...")
@@ -410,13 +425,19 @@ def imprimir_como_pdf(caminho_planilha, ano, codigo_lancamento):
     botao_ok.click()
 
     return salvar_pdf(
-        caminho_planilha,
+        nome_funcionario,
         ano,
-        codigo_lancamento
+        codigo_lancamento,
+        pasta_saida,
     )
 
 
-def salvar_pdf(caminho_planilha, ano, codigo_lancamento):
+def salvar_pdf(
+    nome_funcionario,
+    ano,
+    codigo_lancamento,
+    pasta_saida,
+):
     desktop = Desktop(backend="win32")
 
     print("Aguardando janela para salvar PDF...")
@@ -441,14 +462,12 @@ def salvar_pdf(caminho_planilha, ano, codigo_lancamento):
     print("Janela de salvamento encontrada.")
     print("Título:", janela.window_text())
 
-    pasta_saida = caminho_planilha.parent
+    pasta_saida.mkdir(parents=True, exist_ok=True)
 
-    nome_arquivo = (
-        f"FALTAS {codigo_lancamento} {ano}.pdf"
-    )
-
+    nome_arquivo = f"FALTAS {codigo_lancamento} {ano}.pdf"
     caminho_pdf = pasta_saida / nome_arquivo
 
+    print("Pasta de saída:", pasta_saida)
     print("Arquivo:", caminho_pdf)
 
     campo_nome = None
@@ -458,9 +477,7 @@ def salvar_pdf(caminho_planilha, ano, codigo_lancamento):
             if controle.class_name() != "Edit":
                 continue
 
-            rect = controle.rectangle()
-
-            if rect.width() > 500:
+            if controle.rectangle().width() > 500:
                 campo_nome = controle
                 break
 
@@ -472,13 +489,9 @@ def salvar_pdf(caminho_planilha, ano, codigo_lancamento):
         return False
 
     campo_nome.set_focus()
-
     pyperclip.copy(str(caminho_pdf))
-
     campo_nome.type_keys("^a")
     campo_nome.type_keys("^v")
-
-    print("Caminho do arquivo preenchido.")
 
     botao_salvar = None
 
@@ -497,13 +510,20 @@ def salvar_pdf(caminho_planilha, ano, codigo_lancamento):
         print("Botão Salvar não encontrado.")
         return False
 
-    print("Clicando em Salvar...")
-
     botao_salvar.click()
 
-    print("PDF salvo.")
+    print("Comando de salvar enviado.")
 
-    return True
+    confirmar_sobrescrita_pdf()
+
+    time.sleep(0.5)
+
+    if caminho_pdf.exists():
+        print("PDF salvo:", caminho_pdf)
+        return True
+
+    print("PDF não encontrado após salvar:", caminho_pdf)
+    return False
 
 
 def fechar_preview():
@@ -617,10 +637,11 @@ def selecionar_funcionarios(dados):
 
 
 def processar_anos(
-    caminho_planilha,
+    caminho_saida,
     inicio_ano,
     fim_ano,
-    codigo_lancamento
+    codigo_lancamento,
+    nome_funcionario,
 ):
     for ano in range(inicio_ano, fim_ano + 1):
 
@@ -639,13 +660,14 @@ def processar_anos(
         clicar_ok()
 
         salvo = processar_resultado(
-            caminho_planilha,
+            nome_funcionario,
             ano,
-            codigo_lancamento
+            codigo_lancamento,
+            caminho_saida,
         )
 
         caminho_pdf = (
-            caminho_planilha.parent
+            caminho_saida
             / f"FALTAS {codigo_lancamento} {ano}.pdf"
         )
 
@@ -678,6 +700,58 @@ def processar_anos(
             )
 
 
+def obter_nome_funcionario(janela):
+    listboxes = janela.descendants(class_name="TListBox")
+
+    for listbox in listboxes:
+        try:
+            for item in listbox.texts():
+                item = item.strip()
+
+                if " - " not in item:
+                    continue
+
+                codigo, nome = item.split(" - ", 1)
+
+                if codigo.strip().isdigit() and nome.strip():
+                    return nome.strip()
+
+        except Exception:
+            pass
+
+    return None
+
+
+def confirmar_sobrescrita_pdf():
+    print("Verificando confirmação de sobrescrita...")
+
+    time.sleep(0.5)
+
+    desktop = Desktop(backend="win32")
+
+    for janela in desktop.windows():
+        try:
+            if (
+                janela.is_visible()
+                and janela.class_name() == "#32770"
+                and "confirmar" in janela.window_text().lower()
+            ):
+                janela.set_focus()
+                janela.type_keys("{LEFT}")
+                time.sleep(0.2)
+                janela.type_keys("{ENTER}")
+
+                print("Confirmação de sobrescrita enviada.")
+                time.sleep(0.5)
+
+                return True
+
+        except Exception:
+            continue
+
+    print("Janela de confirmação não encontrada.")
+    return False
+
 def main():
     parser = argparse.ArgumentParser(
         description="Bot de automação do sistema de Recursos Humanos."
@@ -703,7 +777,21 @@ def main():
         help="Caminho da planilha Excel com matrícula e nome."
     )
 
+    parser.add_argument(
+        "--out",
+        type=Path,
+        help="Pasta de saída dos PDFs gerados."
+    )
+    
     args = parser.parse_args()
+
+    pasta_saida = (
+        args.out
+        if args.out is not None
+        else DIRETORIO_SERVIDORES
+    )
+
+    pasta_saida = pasta_saida.resolve()
 
     try:
         inicio_ano, fim_ano = interpretar_intervalo_anos(
@@ -736,9 +824,12 @@ def main():
             "Informe --mat MATRICULA ou --planilha CAMINHO."
         )
 
+    
+
+    # Seleciona todos os funcionários uma única vez.
     selecionar_funcionarios(dados)
 
-    # Processa todos os anos para cada lançamento.
+    # O relatório contém todos os funcionários selecionados.
     for codigo_lancamento in ["682", "619"]:
         print()
         print("#" * 60)
@@ -746,10 +837,11 @@ def main():
         print("#" * 60)
 
         processar_anos(
-            Path.cwd(),
+            pasta_saida,
             inicio_ano,
             fim_ano,
-            codigo_lancamento
+            codigo_lancamento,
+            "",
         )
 
 
