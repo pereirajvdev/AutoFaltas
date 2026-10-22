@@ -812,11 +812,16 @@ def main():
     
     args = parser.parse_args()
 
-    pasta_saida = (
-        args.out
-        if args.out is not None
-        else DIRETORIO_SERVIDORES
-    )
+    if args.out is not None:
+        pasta_saida = args.out
+
+    elif args.planilha is not None:
+        pasta_saida = args.planilha.resolve().parent
+
+    else:
+        pasta_saida = DIRETORIO_SERVIDORES
+
+    pasta_saida = pasta_saida.resolve()
 
     pasta_saida = pasta_saida.resolve()
 
