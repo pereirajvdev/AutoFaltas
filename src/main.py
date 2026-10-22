@@ -1,3 +1,5 @@
+
+import re
 import argparse
 import time
 from pathlib import Path
@@ -15,7 +17,7 @@ TITULO_JANELA = (
 )
 
 DIRETORIO_SERVIDORES = Path(
-    r"C:\CAMINHO\PARA\Servidores"
+    r"C:\Users\Joao Castro\Desktop\JOAO\Servidores"
 )
 
 
@@ -231,7 +233,15 @@ def clicar_ok():
 def get_screen_name():
     desktop = Desktop(backend="win32")
 
-    for janela in desktop.windows():
+    try:
+        janelas = desktop.windows()
+    except Exception as erro:
+        print(
+            f"[AVISO] Falha ao enumerar janelas: {erro}"
+        )
+        return "Desconhecida"
+
+    for janela in janelas:
         try:
             titulo = janela.window_text()
             classe = janela.class_name()
@@ -246,7 +256,8 @@ def get_screen_name():
                 return "Preview"
 
         except Exception:
-            pass
+            # A janela pode ter sido destruída durante a consulta.
+            continue
 
     return "Desconhecida"
 
@@ -259,15 +270,17 @@ def processar_resultado(
 ):
     print("Aguardando resultado...")
 
-    while True:
+    inicio = time.monotonic()
+    timeout = 120
+
+    while time.monotonic() - inicio < timeout:
         tela_atual = get_screen_name()
 
         if tela_atual == "Preview":
             print("Relatório aberto no preview.")
 
-            # Localiza e guarda a janela do preview
-            desktop = Desktop(backend="win32")
             preview = None
+            desktop = Desktop(backend="win32")
 
             try:
                 for janela in desktop.windows():
@@ -281,11 +294,12 @@ def processar_resultado(
                             break
                     except Exception:
                         continue
-            except Exception:
-                pass
 
-            if preview is None:
-                print("Não foi possível obter a janela do preview.")
+            except Exception as erro:
+                print(
+                    "[AVISO] Falha ao localizar o preview: "
+                    f"{erro}"
+                )
 
             clicar_botao_preview()
 
@@ -296,37 +310,39 @@ def processar_resultado(
                 pasta_saida,
             )
 
-            if salvo and preview is not None:
+            if salvo:
                 print("Fechando preview...")
 
-                try:
-                    preview.close()
-                    time.sleep(0.5)
-                except Exception as e:
-                    print(
-                        f"Falha ao fechar normalmente: {e}"
-                    )
+                if preview is not None:
+                    try:
+                        if preview.is_valid():
+                            preview.close()
+                            time.sleep(0.5)
 
-                # Verifica se ainda está aberto
-                try:
-                    if preview.exists():
+                    except Exception as erro:
                         print(
-                            "Preview ainda aberto. "
-                            "Forçando fechamento..."
+                            "[AVISO] Não foi possível fechar "
+                            f"o preview normalmente: {erro}"
                         )
 
-                        preview.kill()
+                # Tenta localizar novamente, pois o handle
+                # anterior pode ter deixado de ser válido.
+                fechar_preview()
 
-                        time.sleep(0.5)
+                return True
 
-                except Exception:
-                    pass
-
-                print("Preview fechado.")
-
-            return salvo
+            print(
+                "[ERRO] A impressão não foi concluída "
+                "com sucesso."
+            )
+            return False
 
         time.sleep(0.2)
+
+    raise TimeoutError(
+        f"O relatório da matrícula/ano {ano} "
+        f"não apareceu no preview em {timeout} segundos."
+    )
 
 
 def clicar_botao_preview():
@@ -752,6 +768,17 @@ def confirmar_sobrescrita_pdf():
     print("Janela de confirmação não encontrada.")
     return False
 
+
+def obter_pasta_servidor(nome_funcionario):
+    nome = re.sub(r'[<>:"/\\|?*]', "_", nome_funcionario)
+    nome = nome.strip().rstrip(".")
+
+    if not nome:
+        raise ValueError("O nome do servidor está vazio.")
+
+    return DIRETORIO_SERVIDORES / nome
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Bot de automação do sistema de Recursos Humanos."
@@ -828,6 +855,29 @@ def main():
 
     # Seleciona todos os funcionários uma única vez.
     selecionar_funcionarios(dados)
+
+    # No modo --mat, identifica o servidor selecionado
+    # e direciona os PDFs para a pasta individual dele.
+    if args.mat:
+        janela = obter_janela()
+        nome_funcionario = obter_nome_funcionario(janela)
+
+        if not nome_funcionario:
+            raise RuntimeError(
+                f"Não foi possível identificar o nome do servidor "
+                f"da matrícula {args.mat}. "
+                "Nenhum relatório será gerado."
+            )
+
+        pasta_saida = obter_pasta_servidor(nome_funcionario)
+        pasta_saida.mkdir(parents=True, exist_ok=True)
+
+        print()
+        print("=" * 60)
+        print(f"Matrícula: {args.mat}")
+        print(f"Servidor: {nome_funcionario}")
+        print(f"Pasta de saída: {pasta_saida}")
+        print("=" * 60)
 
     # O relatório contém todos os funcionários selecionados.
     for codigo_lancamento in ["682", "619"]:
