@@ -63,19 +63,6 @@ def ler_planilha(caminho):
     return dados
 
 
-def obter_janela():
-    desktop = Desktop(backend="win32")
-
-    janela = desktop.window(title=TITULO_JANELA_PRINCIPAL)
-
-    if not janela.exists(timeout=5):
-        raise RuntimeError(
-            "Janela do Gerador de Relatórios não encontrada."
-        )
-
-    return janela
-
-
 def encontrar_campo_funcionario(janela):
     abas = janela.descendants(
         class_name="TcxTabSheet"
@@ -172,8 +159,7 @@ def preencher_matricula(matricula):
     controle.type_keys("^v")
 
 
-def preencher_lancamento(valor):
-    janela = obter_janela()
+def preencher_lancamento(valor, janela):
 
     controle = encontrar_campo_lancamento(janela)
 
@@ -196,7 +182,8 @@ def preencher_lancamento(valor):
 
 
 def pressionar_enter():
-    janela = obter_janela()
+    janela = aguardar_janela(TITULO_JANELA_PRINCIPAL)
+    janela.set_focus()
 
     controle = encontrar_campo_funcionario(janela)
 
@@ -222,55 +209,6 @@ def encontrar_botao_ok(janela):
             pass
 
     return None
-
-
-def clicar_ok():
-    janela = obter_janela()
-
-    botao = encontrar_botao_ok(janela)
-
-    if botao is None:
-        raise RuntimeError(
-            "Botão OK não encontrado."
-        )
-
-    print(
-        f"Clicando em OK (handle atual: {botao.handle})"
-    )
-
-    botao.click()
-
-
-def get_screen_name():
-    desktop = Desktop(backend="win32")
-
-    try:
-        janelas = desktop.windows()
-    except Exception as erro:
-        print(
-            f"[AVISO] Falha ao enumerar janelas: {erro}"
-        )
-        return "Desconhecida"
-
-    for janela in janelas:
-        try:
-            titulo = janela.window_text()
-            classe = janela.class_name()
-
-            if titulo == TITULO_JANELA_PRINCIPAL:
-                return "Gerador"
-
-            if (
-                titulo == TITULO_LANCAMENTOS_ESPECIFICOS
-                and classe == "TfrmPreview"
-            ):
-                return "Preview"
-
-        except Exception:
-            # A janela pode ter sido destruída durante a consulta.
-            continue
-
-    return "Desconhecida"
 
 
 def processar_resultado(
@@ -314,8 +252,6 @@ def clicar_botao_preview():
 
     print("Botão clicado.")
 
-    time.sleep(.5)
-
 
 def imprimir_como_pdf(
     nome_funcionario,
@@ -358,7 +294,7 @@ def imprimir_como_pdf(
         print("Erro ao selecionar impressora:", e)
         return False
 
-    time.sleep(0.5)
+    time.sleep(0.1)
 
     botao_ok = None
 
@@ -456,53 +392,25 @@ def salvar_pdf(
     if janela.window_text() == TITULO_SOBRESCREVER:
         confirmar_sobrescrita_pdf(janela)
 
-    time.sleep(0.5)
-
     if caminho_pdf.exists():
         print("PDF salvo:", caminho_pdf)
         return True
-
-    input("continuar...")
     
     print("PDF não encontrado após salvar:", caminho_pdf)
     return False
 
 
 def fechar_preview():
-    desktop = Desktop(backend="win32")
-
     try:
-        janelas = desktop.windows()
-    except Exception:
-        print("Não foi possível listar as janelas no momento.")
+        janela = aguardar_janela(TITULO_LANCAMENTOS_ESPECIFICOS)
+        janela.close()
+        print("Preview fechado.")
+
+        return True
+    except:
+        print("Preview não encontrado para fechar.")
+
         return False
-
-    for janela in janelas:
-        try:
-            if (
-                janela.window_text()
-                == TITULO_LANCAMENTOS_ESPECIFICOS
-                and janela.class_name() == "TfrmPreview"
-            ):
-                print(
-                    "Fechando Lancamentos_Especificos__por_Ano..."
-                )
-
-                janela.close()
-
-                time.sleep(0.5)
-
-                print("Preview fechado.")
-
-                return True
-
-        except Exception:
-            # Ignora janelas que foram destruídas durante a busca
-            continue
-
-    print("Preview não encontrado para fechar.")
-
-    return False
 
 
 def interpretar_intervalo_anos(valor):
@@ -545,8 +453,7 @@ def encontrar_campo_ano(janela):
     return None
 
 
-def preencher_ano(ano):
-    janela = obter_janela()
+def preencher_ano(ano, janela):
     controle = encontrar_campo_ano(janela)
 
     if controle is None:
@@ -595,11 +502,26 @@ def processar_anos(
         )
         print("=" * 60)
 
-        preencher_ano(ano)
+        janela = aguardar_janela(TITULO_JANELA_PRINCIPAL)
+        janela.set_focus()
 
-        preencher_lancamento(codigo_lancamento)
+        preencher_ano(ano, janela)
+        preencher_lancamento(codigo_lancamento, janela)
 
-        clicar_ok()
+        # Clicar no botão OK do Gerador
+        botao = encontrar_botao_ok(janela)
+    
+        if botao is None:
+            raise RuntimeError(
+                "Botão OK não encontrado."
+            )
+    
+        print(
+            f"Clicando em OK (handle atual: {botao.handle})"
+        )
+    
+        botao.click()
+        
 
         salvo = processar_resultado(
             nome_funcionario,
@@ -667,11 +589,8 @@ def obter_nome_funcionario(janela):
 def confirmar_sobrescrita_pdf(janela):
     print("Verificando confirmação de sobrescrita...")
 
-    time.sleep(0.5)
     
     janela.type_keys("{LEFT}")
-
-    time.sleep(0.2)
     
     janela.type_keys("{ENTER}")
 
@@ -848,7 +767,8 @@ def main():
     # No modo --mat, identifica o servidor selecionado
     # e direciona os PDFs para a pasta individual dele.
     if args.mat:
-        janela = obter_janela()
+        janela = aguardar_janela(TITULO_JANELA_PRINCIPAL)
+        janela.set_focus()
         nome_funcionario = obter_nome_funcionario(janela)
 
         if not nome_funcionario:
