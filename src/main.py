@@ -324,12 +324,13 @@ def imprimir_como_pdf(
     pasta_saida,
 ):
     janela = aguardar_janela(TITULO_IMPRIMIR, TITULO_LANCAMENTOS_ESPECIFICOS)
+    tentativa = 0
     while janela.window_text() == TITULO_LANCAMENTOS_ESPECIFICOS:
         janela.set_focus()
         print(f"foco setado novamente em {TITULO_LANCAMENTOS_ESPECIFICOS}"
-              "\nClicando em preview novamente")
-
+              "\nClicando em preview novamente. Tentativa: "+ tentativa)
         clicar_botao_preview()
+        tentativa =+ 1
     janela.set_focus()
     
     print("Janela de impressão encontrada.")
@@ -338,6 +339,9 @@ def imprimir_como_pdf(
 
     time.sleep(.5)
 
+    janela = aguardar_janela(TITULO_IMPRIMIR)
+    janela.set_focus()
+    
     for controle in janela.descendants():
         try:
             if controle.class_name() != "TComboBox":
@@ -706,6 +710,11 @@ def localizar_janela(titulo_esperado):
             titulo = janela.window_text().strip()
 
             if titulo_esperado.casefold() in titulo.casefold():
+                if "Preparando".casefold() in titulo.casefold() and (
+                    "Preparando".casefold() not in titulo_esperado.casefold()
+                    ):
+                    print("[Ignorando]: " + titulo)
+                    continue
                 print(f"[OK] Janela identificada: {titulo}")
                 return janela
 
@@ -749,13 +758,6 @@ def aguardar_janela(*titulos_esperados, time_limit=TEMPO_LIMITE):
                         f"{titulo_real}"
                     )
                     continue
-
-                a = "Não está respondendo" not in titulo_real
-
-                print(
-                    f"Esse eh o titulo: {titulo_real} "
-                    f"|| verificação {a}"
-                )
 
                 return janela
 
