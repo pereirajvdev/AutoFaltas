@@ -323,24 +323,12 @@ def imprimir_como_pdf(
     codigo_lancamento,
     pasta_saida,
 ):
-    janela = aguardar_janela(TITULO_IMPRIMIR, TITULO_LANCAMENTOS_ESPECIFICOS)
-    tentativa = 0
-    while janela.window_text() == TITULO_LANCAMENTOS_ESPECIFICOS:
-        janela.set_focus()
-        print(f"foco setado novamente em {TITULO_LANCAMENTOS_ESPECIFICOS}"
-              "\nClicando em preview novamente. Tentativa: "+ tentativa)
-        clicar_botao_preview()
-        tentativa =+ 1
+    janela = aguardar_janela(TITULO_IMPRIMIR)
     janela.set_focus()
     
     print("Janela de impressão encontrada.")
 
     combo_impressora = None
-
-    time.sleep(.5)
-
-    janela = aguardar_janela(TITULO_IMPRIMIR)
-    janela.set_focus()
     
     for controle in janela.descendants():
         try:
@@ -708,13 +696,10 @@ def localizar_janela(titulo_esperado):
     for janela in Desktop(backend="win32").windows():
         try:
             titulo = janela.window_text().strip()
+            if len(titulo) != len(titulo_esperado):
+                continue
 
             if titulo_esperado.casefold() in titulo.casefold():
-                if "Preparando".casefold() in titulo.casefold() and (
-                    "Preparando".casefold() not in titulo_esperado.casefold()
-                    ):
-                    print("[Ignorando]: " + titulo)
-                    continue
                 print(f"[OK] Janela identificada: {titulo}")
                 return janela
 
