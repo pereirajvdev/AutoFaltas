@@ -1,27 +1,29 @@
-
-import re
 import argparse
+import ctypes
+import re
 import time
+from contextlib import contextmanager
+from ctypes import wintypes
+from functools import wraps
 from pathlib import Path
 
 from pywinauto import Desktop
 from pywinauto import mouse
+from pywinauto.timings import Timings
 
-import pandas as pd
 import pyperclip
 
 
+# ======================================================================
+# CONSTANTES
+# ======================================================================
 TITULO_JANELA_PRINCIPAL = (
     "Gerador de Relatórios "
     "( Versão: 4.0 ) - Recursos Humanos e Folha de Pagamento"
 )
-
 TITULO_LANCAMENTOS_ESPECIFICOS = "Lancamentos_Especificos__por_Ano"
-
 TITULO_IMPRIMIR = "Imprimir"
-
 TITULO_SOBRESCREVER = "Confirmar Salvar como"
-
 TITULO_SAIDA_IMPRESSAO = "Salvar saída de impressão como"
 
 DIRETORIO_SERVIDORES = Path(
@@ -29,9 +31,396 @@ DIRETORIO_SERVIDORES = Path(
 )
 
 TEMPO_LIMITE = 60
-INTERVALO_VERIFICACAO = 0.3
+TEMPO_ARQUIVO_PDF = 15
+
+# Intervalo de polling. Agora a verificação é barata (ctypes), então pode ser curto.
+INTERVALO_VERIFICACAO = 0.05
+
+# Pausas de segurança. A busca antiga de janelas era lenta e, sem querer,
+# funcionava como "pausa" entre as ações. Como agora é rápida, estas pausas
+# curtas garantem que o Delphi processou a ação anterior.
+# Se a automação estiver estável, você pode reduzi-las UMA POR VEZ.
+PAUSA_APOS_COLAR_MATRICULA = 0.15      # entre colar a matrícula e dar ENTER
+PAUSA_APOS_SELECIONAR_FUNCIONARIO = 0.3  # igual ao original
+PAUSA_ENTRE_CAMPOS = 0.1               # ano -> lançamento -> botão OK
+PAUSA_ANTES_CLIQUE_PREVIEW = 0.3       # preview aberto -> clique por coordenada
+PAUSA_APOS_SELECIONAR_IMPRESSORA = 0.1  # igual ao original
+
+
+# ======================================================================
+# WIN32 (ctypes): enumeração rápida de janelas
+# ======================================================================
+_user32 = ctypes.windll.user32
+
+_WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+_user32.EnumWindows.argtypes = [_WNDENUMPROC, wintypes.LPARAM]
+_user32.EnumWindows.restype = wintypes.BOOL
+_user32.IsWindow.argtypes = [wintypes.HWND]
+_user32.IsWindow.restype = wintypes.BOOL
+_user32.IsWindowVisible.argtypes = [wintypes.HWND]
+_user32.IsWindowVisible.restype = wintypes.BOOL
+_user32.IsHungAppWindow.argtypes = [wintypes.HWND]
+_user32.IsHungAppWindow.restype = wintypes.BOOL
+_user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+_user32.GetWindowTextLengthW.restype = ctypes.c_int
+_user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+_user32.GetWindowTextW.restype = ctypes.c_int
+
+# Instância única de Desktop, usada só para criar o wrapper da janela escolhida.
+_DESKTOP = Desktop(backend="win32")
+
+_AVISOS_TRAVADA = set()
+
+
+# ======================================================================
+# MEDIÇÃO DE DESEMPENHO (opcional: só ativa com --perf)
+# ======================================================================
+PERF_ATIVO = False
+CACHE_ATIVO = True
+_TEMPOS = {}
+
+
+def _registrar_tempo(nome, duracao):
+    registro = _TEMPOS.setdefault(nome, [0, 0.0])
+    registro[0] += 1
+    registro[1] += duracao
+
+
+@contextmanager
+def medir(nome):
+    """Mede o tempo de um bloco. Sem efeito se --perf estiver desligado."""
+    if not PERF_ATIVO:
+        yield
+        return
+
+    inicio = time.perf_counter()
+    try:
+        yield
+    finally:
+        _registrar_tempo(nome, time.perf_counter() - inicio)
+
+
+def cronometrar(nome=None):
+    """Decorator que mede o tempo total de uma função (só com --perf)."""
+    def decorador(func):
+        rotulo = nome or func.__name__
+
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            if not PERF_ATIVO:
+                return func(*args, **kwargs)
+
+            inicio = time.perf_counter()
+            try:
+                return func(*args, **kwargs)
+            finally:
+                _registrar_tempo(rotulo, time.perf_counter() - inicio)
+
+        return wrapper
+    return decorador
+
+
+def imprimir_relatorio_tempos():
+    if not PERF_ATIVO or not _TEMPOS:
+        return
+
+    print("\n" + "=" * 66)
+    print(" RELATÓRIO DE DESEMPENHO (--perf)")
+    print(" Obs.: tempos aninhados se sobrepõem; não some as linhas.")
+    print("=" * 66)
+    print(f"{'Etapa':<42}{'Chamadas':>9}{'Total (s)':>11}{'Média (s)':>11}")
+
+    for nome, (chamadas, total) in sorted(
+        _TEMPOS.items(), key=lambda item: item[1][1], reverse=True
+    ):
+        media = total / chamadas if chamadas else 0.0
+        print(f"{nome:<42}{chamadas:>9}{total:>11.2f}{media:>11.3f}")
+
+    print("=" * 66)
+
+
+# ======================================================================
+# JANELAS
+# ======================================================================
+def _listar_janelas_visiveis():
+    """Enumera janelas de nível superior visíveis: [(hwnd, titulo), ...]."""
+    resultado = []
+
+    def callback(hwnd, _lparam):
+        if _user32.IsWindowVisible(hwnd):
+            tamanho = _user32.GetWindowTextLengthW(hwnd)
+            if tamanho:
+                buffer = ctypes.create_unicode_buffer(tamanho + 1)
+                _user32.GetWindowTextW(hwnd, buffer, tamanho + 1)
+                resultado.append((hwnd, buffer.value))
+        return True
+
+    proc = _WNDENUMPROC(callback)
+    _user32.EnumWindows(proc, 0)
+    return resultado
+
+
+def _janela_visivel(hwnd):
+    return bool(_user32.IsWindow(hwnd)) and bool(_user32.IsWindowVisible(hwnd))
+
+
+def _buscar_janela(titulos):
+    """
+    Faz UMA enumeração e retorna (hwnd, titulo_real) da primeira janela
+    válida, respeitando a ordem dos títulos informados.
+    Comparação: texto idêntico (sem diferenciar maiúsculas/minúsculas),
+    como na versão original. Janelas travadas são ignoradas.
+    """
+    candidatas = {}
+
+    for hwnd, texto in _listar_janelas_visiveis():
+        texto = texto.strip()
+        candidatas.setdefault(texto.casefold(), []).append((hwnd, texto))
+
+    for titulo in titulos:
+        for hwnd, texto in candidatas.get(titulo.strip().casefold(), []):
+            if _user32.IsHungAppWindow(hwnd):
+                if hwnd not in _AVISOS_TRAVADA:
+                    _AVISOS_TRAVADA.add(hwnd)
+                    print(f"[AGUARDANDO] Janela sem resposta: {texto}")
+                continue
+
+            return hwnd, texto
+
+    return None
+
+
+def _criar_wrapper(hwnd):
+    return _DESKTOP.window(handle=hwnd).wrapper_object()
+
+
+@cronometrar()
+def localizar_janela(titulo_esperado):
+    """Verificação única (sem espera). Retorna wrapper ou None."""
+    achado = _buscar_janela([titulo_esperado])
+
+    if achado is None:
+        return None
+
+    hwnd, titulo = achado
+    print(f"[OK] Janela identificada: {titulo}")
+    return _criar_wrapper(hwnd)
+
+
+@cronometrar()
+def aguardar_janela(*titulos_esperados, time_limit=TEMPO_LIMITE):
+    """
+    Aguarda até que uma janela com um dos títulos apareça.
+    Retorna o wrapper da primeira janela válida (seguindo a ordem dos
+    títulos) ou None se o tempo limite estourar.
+    """
+    print(
+        f"[INFO] Aguardando uma das janelas: "
+        f"{', '.join(titulos_esperados)}"
+    )
+
+    limite = time.monotonic() + time_limit
+
+    while True:
+        with medir("enumerar janelas"):
+            achado = _buscar_janela(titulos_esperados)
+
+        if achado is not None:
+            hwnd, titulo = achado
+            print(f"[OK] Janela identificada: {titulo}")
+            return _criar_wrapper(hwnd)
+
+        if time.monotonic() >= limite:
+            break
+
+        time.sleep(INTERVALO_VERIFICACAO)
+
+    print(
+        f"[INFO] Nenhuma janela válida apareceu em "
+        f"{time_limit} segundos: "
+        f"{', '.join(titulos_esperados)}"
+    )
+
+    return None
+
+
+def exigir_janela(*titulos_esperados, time_limit=TEMPO_LIMITE):
+    janela = aguardar_janela(*titulos_esperados, time_limit=time_limit)
+
+    if janela is None:
+        raise RuntimeError(
+            "Janela não encontrada: " + ", ".join(titulos_esperados)
+        )
+
+    return janela
+
+
+def aguardar_fechamento(hwnd, time_limit=10):
+    """Espera até a janela deixar de existir/ficar visível."""
+    limite = time.monotonic() + time_limit
+
+    while _janela_visivel(hwnd) and time.monotonic() < limite:
+        time.sleep(INTERVALO_VERIFICACAO)
+
+    return not _janela_visivel(hwnd)
+
+
+# ======================================================================
+# CONTROLES (com cache validado)
+# ======================================================================
+_CACHE_CONTROLES = {}
+
+
+def _controle_valido(controle):
+    try:
+        return _janela_visivel(controle.handle)
+    except Exception:
+        return False
+
+
+def obter_controle(chave, janela, buscador):
+    """
+    Retorna o controle, reutilizando a referência se o handle ainda existir
+    e estiver visível. Caso contrário, refaz a busca completa.
+    Com --sem-cache, sempre busca de novo (comportamento original).
+    """
+    chave_cache = (chave, janela.handle)
+
+    if CACHE_ATIVO:
+        controle = _CACHE_CONTROLES.get(chave_cache)
+
+        if controle is not None and _controle_valido(controle):
+            return controle
+
+    controle = buscador(janela)
+
+    if controle is not None and CACHE_ATIVO:
+        _CACHE_CONTROLES[chave_cache] = controle
+    else:
+        _CACHE_CONTROLES.pop(chave_cache, None)
+
+    return controle
+
+
+@cronometrar()
+def encontrar_campo_funcionario(janela):
+    abas = janela.descendants(class_name="TcxTabSheet")
+
+    for aba in abas:
+        try:
+            if aba.window_text() != "Funcionário":
+                continue
+
+            combos = aba.descendants(class_name="TelLookupCombo")
+
+            if combos:
+                return combos[0]
+
+        except Exception:
+            pass
+
+    return None
+
+
+@cronometrar()
+def encontrar_campo_lancamento(janela):
+    abas = janela.descendants(class_name="TcxTabSheet")
+
+    # Primeiro encontramos a aba Funcionário
+    aba_funcionario = None
+
+    for aba in abas:
+        try:
+            if aba.window_text() == "Funcionário":
+                aba_funcionario = aba
+                break
+        except Exception:
+            pass
+
+    # Procuramos todos os TelLookupCombo da janela
+    combos = janela.descendants(class_name="TelLookupCombo")
+
+    for combo in combos:
+        try:
+            # Combo dentro da aba Funcionário não é o campo de lançamento.
+            if aba_funcionario is not None:
+                try:
+                    if combo.is_child(aba_funcionario):
+                        continue
+                except Exception:
+                    pass
+
+            # Verificamos o painel pai imediato
+            pais = combo.parent()
+
+            if pais is not None:
+                combos_pai = pais.descendants(class_name="TelLookupCombo")
+
+                if len(combos_pai) == 1:
+                    return combo
+
+        except Exception:
+            pass
+
+    return None
+
+
+@cronometrar()
+def encontrar_campo_ano(janela):
+    spin_edits = janela.descendants(class_name="TcxSpinEdit")
+
+    for spin in spin_edits:
+        try:
+            filhos = spin.descendants(class_name="TcxCustomInnerTextEdit")
+
+            for filho in filhos:
+                texto = filho.window_text().strip()
+
+                if texto.isdigit() and len(texto) == 4:
+                    return filho
+
+        except Exception:
+            pass
+
+    return None
+
+
+@cronometrar()
+def encontrar_botao_ok(janela):
+    botoes = janela.descendants(class_name="TBitBtn")
+
+    for botao in botoes:
+        try:
+            if botao.window_text() == "&OK":
+                return botao
+        except Exception:
+            pass
+
+    return None
+
+
+# ======================================================================
+# ENTRADA DE DADOS
+# ======================================================================
+@cronometrar()
+def colar_texto(controle, valor):
+    """
+    Foca o controle UMA vez, copia o valor e cola substituindo o conteúdo.
+    set_foreground=False evita que type_keys refaça set_focus a cada chamada
+    (por padrão o pywinauto chama set_focus dentro de cada type_keys).
+    """
+    controle.set_focus()
+
+    pyperclip.copy(str(valor))
+
+    controle.type_keys("^a", set_foreground=False)
+    controle.type_keys("^v", set_foreground=False)
+
 
 def ler_planilha(caminho):
+    import pandas as pd  # importação tardia: só custa tempo quando usado
+
     df = pd.read_excel(caminho)
 
     if len(df.columns) < 2:
@@ -63,185 +452,85 @@ def ler_planilha(caminho):
     return dados
 
 
-def encontrar_campo_funcionario(janela):
-    abas = janela.descendants(
-        class_name="TcxTabSheet"
+@cronometrar()
+def selecionar_funcionario(matricula):
+    janela = exigir_janela(TITULO_JANELA_PRINCIPAL)
+
+    controle = obter_controle(
+        "campo_funcionario", janela, encontrar_campo_funcionario
     )
-
-    for aba in abas:
-        try:
-            if aba.window_text() != "Funcionário":
-                continue
-
-            combos = aba.descendants(
-                class_name="TelLookupCombo"
-            )
-
-            if combos:
-                return combos[0]
-
-        except Exception:
-            pass
-
-    return None
-
-
-def encontrar_campo_lancamento(janela):
-    abas = janela.descendants(
-        class_name="TcxTabSheet"
-    )
-
-    # Primeiro encontramos a aba Funcionário
-    aba_funcionario = None
-
-    for aba in abas:
-        try:
-            if aba.window_text() == "Funcionário":
-                aba_funcionario = aba
-                break
-        except Exception:
-            pass
-
-    # Procuramos todos os TelLookupCombo da janela
-    combos = janela.descendants(
-        class_name="TelLookupCombo"
-    )
-
-    for combo in combos:
-        try:
-            # Se o combo estiver dentro da aba Funcionário,
-            # não é o campo de lançamento.
-            if aba_funcionario is not None:
-                try:
-                    if combo.is_child(aba_funcionario):
-                        continue
-                except Exception:
-                    pass
-
-            # Verificamos o painel pai imediato
-            pais = combo.parent()
-
-            if pais is not None:
-                combos_pai = pais.descendants(
-                    class_name="TelLookupCombo"
-                )
-
-                if len(combos_pai) == 1:
-                    return combo
-
-        except Exception:
-            pass
-
-    return None
-
-
-def preencher_matricula(matricula):
-    janela = aguardar_janela(TITULO_JANELA_PRINCIPAL)
-    janela.set_focus()
-
-    controle = encontrar_campo_funcionario(janela)
 
     if controle is None:
-        raise RuntimeError(
-            "Campo de matrícula não encontrado."
-        )
+        raise RuntimeError("Campo de matrícula não encontrado.")
 
     print(
         f"Preenchendo matrícula {matricula} "
         f"(handle atual: {controle.handle})"
     )
 
+    colar_texto(controle, matricula)
+
+    time.sleep(PAUSA_APOS_COLAR_MATRICULA)
+
+    # Mesmo comportamento do original: foca o campo antes do ENTER.
     controle.set_focus()
-
-    pyperclip.copy(str(matricula))
-
-    controle.type_keys("^a")
-    controle.type_keys("^v")
+    controle.type_keys("{ENTER}", set_foreground=False)
 
 
-def preencher_lancamento(valor, janela):
+@cronometrar()
+def selecionar_funcionarios(dados):
+    print(f"Selecionando {len(dados)} funcionários...")
 
-    controle = encontrar_campo_lancamento(janela)
+    for matricula, nome in dados:
+        print(f"Selecionando: {matricula} - {nome}")
+
+        selecionar_funcionario(matricula)
+
+        time.sleep(PAUSA_APOS_SELECIONAR_FUNCIONARIO)
+
+
+@cronometrar()
+def preencher_ano(ano, janela):
+    controle = obter_controle("campo_ano", janela, encontrar_campo_ano)
 
     if controle is None:
-        raise RuntimeError(
-            "Campo de lançamento não encontrado."
-        )
+        raise RuntimeError("Campo de ano não encontrado.")
+
+    print(
+        f"Preenchendo ano {ano} "
+        f"(handle atual: {controle.handle})"
+    )
+
+    colar_texto(controle, ano)
+
+    controle.type_keys("{ENTER}", set_foreground=False)
+
+
+@cronometrar()
+def preencher_lancamento(valor, janela):
+    controle = obter_controle(
+        "campo_lancamento", janela, encontrar_campo_lancamento
+    )
+
+    if controle is None:
+        raise RuntimeError("Campo de lançamento não encontrado.")
 
     print(
         f"Preenchendo lançamento {valor} "
         f"(handle atual: {controle.handle})"
     )
 
-    controle.set_focus()
-
-    pyperclip.copy(str(valor))
-
-    controle.type_keys("^a")
-    controle.type_keys("^v")
+    colar_texto(controle, valor)
 
 
-def pressionar_enter():
-    janela = aguardar_janela(TITULO_JANELA_PRINCIPAL)
-    janela.set_focus()
-
-    controle = encontrar_campo_funcionario(janela)
-
-    if controle is None:
-        raise RuntimeError(
-            "Campo de matrícula não encontrado."
-        )
-
-    controle.set_focus()
-    controle.type_keys("{ENTER}")
-
-
-def encontrar_botao_ok(janela):
-    botoes = janela.descendants(
-        class_name="TBitBtn"
-    )
-
-    for botao in botoes:
-        try:
-            if botao.window_text() == "&OK":
-                return botao
-        except Exception:
-            pass
-
-    return None
-
-
-def processar_resultado(
-    nome_funcionario,
-    ano,
-    codigo_lancamento,
-    pasta_saida,
-):
-    print("Aguardando resultado...")
-
-    clicar_botao_preview()
-
-    salvo = imprimir_como_pdf(
-        nome_funcionario,
-        ano,
-        codigo_lancamento,
-        pasta_saida,
-    )
-
-    if salvo:
-        janela = aguardar_janela(TITULO_LANCAMENTOS_ESPECIFICOS)
-        janela.set_focus()
-
-        fechar_preview()
-
-        return True
-    
-    return False
-
-
+# ======================================================================
+# PREVIEW / IMPRESSÃO / PDF
+# ======================================================================
 def clicar_botao_preview():
-    janela = aguardar_janela(TITULO_LANCAMENTOS_ESPECIFICOS)
+    janela = exigir_janela(TITULO_LANCAMENTOS_ESPECIFICOS)
     janela.set_focus()
+
+    time.sleep(PAUSA_ANTES_CLIQUE_PREVIEW)
 
     x = 306
     y = 39
@@ -253,33 +542,23 @@ def clicar_botao_preview():
     print("Botão clicado.")
 
 
-def imprimir_como_pdf(
-    nome_funcionario,
-    ano,
-    codigo_lancamento,
-    pasta_saida,
-):
-    janela = aguardar_janela(TITULO_IMPRIMIR)
+@cronometrar()
+def imprimir_como_pdf(ano, codigo_lancamento, pasta_saida):
+    janela = exigir_janela(TITULO_IMPRIMIR)
     janela.set_focus()
-    
+
     print("Janela de impressão encontrada.")
 
     combo_impressora = None
-    
-    for controle in janela.descendants():
+
+    for controle in janela.descendants(class_name="TComboBox"):
         try:
-            if controle.class_name() != "TComboBox":
-                continue
-
-            itens = controle.texts()
-
-            if "Microsoft Print to PDF" in itens:
+            if "Microsoft Print to PDF" in controle.texts():
                 combo_impressora = controle
                 break
-
         except Exception:
             pass
-        
+
     if combo_impressora is None:
         print("ComboBox da impressora não encontrada.")
         return False
@@ -287,23 +566,18 @@ def imprimir_como_pdf(
     print("Selecionando Microsoft Print to PDF...")
 
     try:
-        combo_impressora.select(
-            "Microsoft Print to PDF"
-        )
+        combo_impressora.select("Microsoft Print to PDF")
     except Exception as e:
         print("Erro ao selecionar impressora:", e)
         return False
 
-    time.sleep(0.1)
+    time.sleep(PAUSA_APOS_SELECIONAR_IMPRESSORA)
 
     botao_ok = None
 
-    for controle in janela.descendants():
+    for controle in janela.descendants(class_name="TButton"):
         try:
-            if (
-                controle.class_name() == "TButton"
-                and controle.window_text() == "OK"
-            ):
+            if controle.window_text() == "OK":
                 botao_ok = controle
                 break
         except Exception:
@@ -316,43 +590,73 @@ def imprimir_como_pdf(
     print("Clicando em OK da impressão...")
 
     botao_ok.click()
-    
-    return salvar_pdf(
-        nome_funcionario,
-        ano,
-        codigo_lancamento,
-        pasta_saida,
-    )
+
+    return salvar_pdf(ano, codigo_lancamento, pasta_saida)
 
 
-def salvar_pdf(
-    nome_funcionario,
-    ano,
-    codigo_lancamento,
-    pasta_saida,
-):
-    janela = aguardar_janela(TITULO_SAIDA_IMPRESSAO)
+def confirmar_sobrescrita_pdf(janela):
+    print("Verificando confirmação de sobrescrita...")
+
+    janela.type_keys("{LEFT}")
+
+    janela.type_keys("{ENTER}")
+
+    print("Confirmação de sobrescrita enviada.")
+
+
+def aguardar_arquivo_pdf(caminho_pdf, mtime_antes, time_limit=TEMPO_ARQUIVO_PDF):
+    """
+    Espera o PDF existir, ter conteúdo e (se já existia) ter sido regravado.
+    Se o tempo estourar, devolve apenas se o arquivo existe.
+    """
+    limite = time.monotonic() + time_limit
+
+    while True:
+        try:
+            info = caminho_pdf.stat()
+
+            if info.st_size > 0 and (
+                mtime_antes is None or info.st_mtime_ns != mtime_antes
+            ):
+                return True
+        except OSError:
+            pass
+
+        if time.monotonic() >= limite:
+            break
+
+        time.sleep(INTERVALO_VERIFICACAO)
+
+    if caminho_pdf.exists():
+        print(
+            "[AVISO] O arquivo existe, mas não foi atualizado "
+            f"em {time_limit}s (pode ser o PDF antigo)."
+        )
+        return True
+
+    return False
+
+
+@cronometrar()
+def salvar_pdf(ano, codigo_lancamento, pasta_saida):
+    janela = exigir_janela(TITULO_SAIDA_IMPRESSAO)
     janela.set_focus()
+    hwnd_salvar = janela.handle
 
     pasta_saida.mkdir(parents=True, exist_ok=True)
 
-    nome_arquivo = f"FALTAS {codigo_lancamento} {ano}.pdf"
-    caminho_pdf = pasta_saida / nome_arquivo
+    caminho_pdf = pasta_saida / f"FALTAS {codigo_lancamento} {ano}.pdf"
 
     print("Pasta de saída:", pasta_saida)
     print("Arquivo:", caminho_pdf)
 
     campo_nome = None
 
-    for controle in janela.descendants():
+    for controle in janela.descendants(class_name="Edit"):
         try:
-            if controle.class_name() != "Edit":
-                continue
-
             if controle.rectangle().width() > 500:
                 campo_nome = controle
                 break
-
         except Exception:
             pass
 
@@ -360,19 +664,13 @@ def salvar_pdf(
         print("Campo do nome do arquivo não encontrado.")
         return False
 
-    campo_nome.set_focus()
-    pyperclip.copy(str(caminho_pdf))
-    campo_nome.type_keys("^a")
-    campo_nome.type_keys("^v")
+    colar_texto(campo_nome, caminho_pdf)
 
     botao_salvar = None
 
-    for controle in janela.descendants():
+    for controle in janela.descendants(class_name="Button"):
         try:
-            if (
-                controle.class_name() == "Button"
-                and controle.window_text() == "Sa&lvar"
-            ):
+            if controle.window_text() == "Sa&lvar":
                 botao_salvar = controle
                 break
         except Exception:
@@ -382,37 +680,86 @@ def salvar_pdf(
         print("Botão Salvar não encontrado.")
         return False
 
+    try:
+        mtime_antes = caminho_pdf.stat().st_mtime_ns
+    except OSError:
+        mtime_antes = None
+
     botao_salvar.click()
 
     print("Comando de salvar enviado.")
 
-    janela = aguardar_janela(TITULO_SOBRESCREVER, TITULO_JANELA_PRINCIPAL)
-    janela.set_focus()
+    # Espera determinística: ou aparece a confirmação de sobrescrita,
+    # ou a janela "Salvar como" fecha sozinha.
+    limite = time.monotonic() + TEMPO_LIMITE
 
-    if janela.window_text() == TITULO_SOBRESCREVER:
-        confirmar_sobrescrita_pdf(janela)
+    while time.monotonic() < limite:
+        confirmacao = localizar_janela(TITULO_SOBRESCREVER)
 
-    if caminho_pdf.exists():
+        if confirmacao is not None:
+            confirmacao.set_focus()
+            confirmar_sobrescrita_pdf(confirmacao)
+            break
+
+        if not _janela_visivel(hwnd_salvar):
+            break
+
+        time.sleep(INTERVALO_VERIFICACAO)
+
+    aguardar_fechamento(hwnd_salvar, TEMPO_LIMITE)
+
+    if aguardar_arquivo_pdf(caminho_pdf, mtime_antes):
         print("PDF salvo:", caminho_pdf)
         return True
-    
+
     print("PDF não encontrado após salvar:", caminho_pdf)
     return False
 
 
 def fechar_preview():
-    try:
-        janela = aguardar_janela(TITULO_LANCAMENTOS_ESPECIFICOS)
-        janela.close()
-        print("Preview fechado.")
+    janela = aguardar_janela(TITULO_LANCAMENTOS_ESPECIFICOS)
 
-        return True
-    except:
+    if janela is None:
         print("Preview não encontrado para fechar.")
-
         return False
 
+    try:
+        hwnd = janela.handle
+        janela.set_focus()
+        janela.close()
+    except Exception as erro:
+        print(f"Erro ao fechar o preview: {erro}")
+        return False
 
+    # Garante que o preview antigo sumiu antes do próximo ano começar.
+    aguardar_fechamento(hwnd)
+
+    print("Preview fechado.")
+    return True
+
+
+@cronometrar()
+def processar_resultado(ano, codigo_lancamento, pasta_saida):
+    print("Aguardando resultado...")
+
+    clicar_botao_preview()
+
+    salvo = imprimir_como_pdf(ano, codigo_lancamento, pasta_saida)
+
+    if salvo:
+        if not fechar_preview():
+            raise RuntimeError(
+                "PDF salvo, mas o preview não pôde ser fechado."
+            )
+
+        return True
+
+    return False
+
+
+# ======================================================================
+# FLUXO PRINCIPAL
+# ======================================================================
 def interpretar_intervalo_anos(valor):
     try:
         inicio, fim = valor.split("-")
@@ -432,136 +779,65 @@ def interpretar_intervalo_anos(valor):
     return inicio, fim
 
 
-def encontrar_campo_ano(janela):
-    spin_edits = janela.descendants(class_name="TcxSpinEdit")
-
-    for spin in spin_edits:
-        try:
-            filhos = spin.descendants(
-                class_name="TcxCustomInnerTextEdit"
-            )
-
-            for filho in filhos:
-                texto = filho.window_text().strip()
-
-                if texto.isdigit() and len(texto) == 4:
-                    return filho
-
-        except Exception:
-            pass
-
-    return None
-
-
-def preencher_ano(ano, janela):
-    controle = encontrar_campo_ano(janela)
-
-    if controle is None:
-        raise RuntimeError("Campo de ano não encontrado.")
-
-    print(
-        f"Preenchendo ano {ano} "
-        f"(handle atual: {controle.handle})"
-    )
-
-    controle.set_focus()
-
-    pyperclip.copy(str(ano))
-    controle.type_keys("^a")
-    controle.type_keys("^v")
-
-    controle.type_keys("{ENTER}")
-
-
-def selecionar_funcionarios(dados):
-    print(f"Selecionando {len(dados)} funcionários...")
-
-    for matricula, nome in dados:
-        print(f"Selecionando: {matricula} - {nome}")
-
-        preencher_matricula(matricula)
-        pressionar_enter()
-
-        time.sleep(0.3)
-
-
-def processar_anos(
-    caminho_saida,
-    inicio_ano,
-    fim_ano,
-    codigo_lancamento,
-    nome_funcionario,
-):
+def processar_anos(caminho_saida, inicio_ano, fim_ano, codigo_lancamento):
     for ano in range(inicio_ano, fim_ano + 1):
 
-        print()
-        print("=" * 60)
-        print(
-            f"PROCESSANDO ANO {ano} - "
-            f"LANÇAMENTO {codigo_lancamento}"
-        )
-        print("=" * 60)
+        with medir(f"ano completo (lançamento {codigo_lancamento})"):
 
-        janela = aguardar_janela(TITULO_JANELA_PRINCIPAL)
-        janela.set_focus()
-
-        preencher_ano(ano, janela)
-        preencher_lancamento(codigo_lancamento, janela)
-
-        # Clicar no botão OK do Gerador
-        botao = encontrar_botao_ok(janela)
-    
-        if botao is None:
-            raise RuntimeError(
-                "Botão OK não encontrado."
+            print()
+            print("=" * 60)
+            print(
+                f"PROCESSANDO ANO {ano} - "
+                f"LANÇAMENTO {codigo_lancamento}"
             )
-    
-        print(
-            f"Clicando em OK (handle atual: {botao.handle})"
-        )
-    
-        botao.click()
-        
+            print("=" * 60)
 
-        salvo = processar_resultado(
-            nome_funcionario,
-            ano,
-            codigo_lancamento,
-            caminho_saida,
-        )
+            janela = exigir_janela(TITULO_JANELA_PRINCIPAL)
+            janela.set_focus()
 
-        caminho_pdf = (
-            caminho_saida
-            / f"FALTAS {codigo_lancamento} {ano}.pdf"
-        )
+            preencher_ano(ano, janela)
+            time.sleep(PAUSA_ENTRE_CAMPOS)
 
-        if salvo:
-            if caminho_pdf.exists():
-                print()
-                print(
-                    f"[OK] PDF CONFIRMADO:"
-                )
-                print(caminho_pdf)
-                print(
-                    f"Tamanho: "
-                    f"{caminho_pdf.stat().st_size:,} bytes"
-                )
+            preencher_lancamento(codigo_lancamento, janela)
+            time.sleep(PAUSA_ENTRE_CAMPOS)
+
+            # Clicar no botão OK do Gerador
+            botao = obter_controle("botao_ok", janela, encontrar_botao_ok)
+
+            if botao is None:
+                raise RuntimeError("Botão OK não encontrado.")
+
+            print("Clicando em OK")
+
+            botao.click()
+
+            salvo = processar_resultado(ano, codigo_lancamento, caminho_saida)
+
+            caminho_pdf = (
+                caminho_saida / f"FALTAS {codigo_lancamento} {ano}.pdf"
+            )
+
+            if salvo:
+                if caminho_pdf.exists():
+                    print()
+                    print("[OK] PDF CONFIRMADO:")
+                    print(caminho_pdf)
+                    print(
+                        f"Tamanho: "
+                        f"{caminho_pdf.stat().st_size:,} bytes"
+                    )
+                else:
+                    print()
+                    print("[ERRO] O sistema informou que o PDF foi salvo,")
+                    print("mas o arquivo NÃO foi encontrado:")
+                    print(caminho_pdf)
+
             else:
                 print()
                 print(
-                    "[ERRO] O sistema informou que o PDF foi salvo,"
+                    f"[ERRO] Falha ao gerar "
+                    f"FALTAS {codigo_lancamento} {ano}.pdf"
                 )
-                print(
-                    "mas o arquivo NÃO foi encontrado:"
-                )
-                print(caminho_pdf)
-
-        else:
-            print()
-            print(
-                f"[ERRO] Falha ao gerar "
-                f"FALTAS {codigo_lancamento} {ano}.pdf"
-            )
 
 
 def obter_nome_funcionario(janela):
@@ -586,17 +862,6 @@ def obter_nome_funcionario(janela):
     return None
 
 
-def confirmar_sobrescrita_pdf(janela):
-    print("Verificando confirmação de sobrescrita...")
-
-    
-    janela.type_keys("{LEFT}")
-    
-    janela.type_keys("{ENTER}")
-
-    print("Confirmação de sobrescrita enviada.")
-
-
 def obter_pasta_servidor(nome_funcionario):
     nome = re.sub(r'[<>:"/\\|?*]', "_", nome_funcionario)
     nome = nome.strip().rstrip(".")
@@ -607,82 +872,11 @@ def obter_pasta_servidor(nome_funcionario):
     return DIRETORIO_SERVIDORES / nome
 
 
-def localizar_janela(titulo_esperado):
-    """
-    Localiza uma janela pelo título ou por um trecho dele.
-    Retorna um objeto pywinauto ou None.
-    """
-    for janela in Desktop(backend="win32").windows():
-        try:
-            titulo = janela.window_text().strip()
-            if len(titulo) != len(titulo_esperado):
-                continue
-
-            if titulo_esperado.casefold() in titulo.casefold():
-                print(f"[OK] Janela identificada: {titulo}")
-                return janela
-
-        except Exception:
-            continue
-
-    return None
-
-
-def aguardar_janela(*titulos_esperados, time_limit=TEMPO_LIMITE):
-    """
-    Aguarda até que uma janela com um dos títulos informados apareça.
-
-    Args:
-        *titulos_esperados: Um ou mais títulos de janelas.
-        time_limit: Tempo máximo de espera, em segundos.
-
-    Returns:
-        Objeto pywinauto da primeira janela válida encontrada ou None.
-    """
-    print(
-        f"[INFO] Aguardando uma das janelas: "
-        f"{', '.join(titulos_esperados)}"
-    )
-
-    limite = time.monotonic() + time_limit
-
-    while time.monotonic() < limite:
-        for titulo_esperado in titulos_esperados:
-            janela = localizar_janela(titulo_esperado)
-
-            if janela is None:
-                continue
-
-            try:
-                titulo_real = janela.window_text().strip()
-
-                if "Não está respondendo" in titulo_real:
-                    print(
-                        f"[AGUARDANDO] Janela sem resposta: "
-                        f"{titulo_real}"
-                    )
-                    continue
-
-                return janela
-
-            except Exception as erro:
-                print(
-                    f"[AVISO] Erro ao verificar o título da janela: "
-                    f"{erro}"
-                )
-
-        time.sleep(INTERVALO_VERIFICACAO)
-
-    print(
-        f"[INFO] Nenhuma janela válida apareceu em "
-        f"{time_limit} segundos: "
-        f"{', '.join(titulos_esperados)}"
-    )
-
-    return None
-
-
 def main():
+    global PERF_ATIVO, CACHE_ATIVO
+
+    inicio_execucao = time.perf_counter()
+
     parser = argparse.ArgumentParser(
         description="Bot de automação do sistema de Recursos Humanos."
     )
@@ -712,8 +906,38 @@ def main():
         type=Path,
         help="Pasta de saída dos PDFs gerados."
     )
-    
+
+    parser.add_argument(
+        "--perf",
+        action="store_true",
+        help="(Opcional) Exibe relatório detalhado de tempos ao final."
+    )
+
+    parser.add_argument(
+        "--rapido",
+        action="store_true",
+        help=(
+            "(Opcional) Reduz as esperas internas do pywinauto "
+            "(Timings.fast()). Teste antes de usar no dia a dia."
+        )
+    )
+
+    parser.add_argument(
+        "--sem-cache",
+        action="store_true",
+        help=(
+            "(Opcional) Desativa o cache de controles e busca tudo "
+            "de novo, como na versão original."
+        )
+    )
+
     args = parser.parse_args()
+
+    PERF_ATIVO = args.perf
+    CACHE_ATIVO = not args.sem_cache
+
+    if args.rapido:
+        Timings.fast()
 
     if args.out is not None:
         pasta_saida = args.out
@@ -726,12 +950,8 @@ def main():
 
     pasta_saida = pasta_saida.resolve()
 
-    pasta_saida = pasta_saida.resolve()
-
     try:
-        inicio_ano, fim_ano = interpretar_intervalo_anos(
-            args.anos
-        )
+        inicio_ano, fim_ano = interpretar_intervalo_anos(args.anos)
     except ValueError as erro:
         parser.error(str(erro))
 
@@ -743,9 +963,7 @@ def main():
 
     elif args.planilha:
         if not args.planilha.exists():
-            parser.error(
-                f"Planilha não encontrada: {args.planilha}"
-            )
+            parser.error(f"Planilha não encontrada: {args.planilha}")
 
         if not args.planilha.is_file():
             parser.error(
@@ -755,11 +973,7 @@ def main():
         dados = ler_planilha(args.planilha)
 
     else:
-        parser.error(
-            "Informe --mat MATRICULA ou --planilha CAMINHO."
-        )
-
-    
+        parser.error("Informe --mat MATRICULA ou --planilha CAMINHO.")
 
     # Seleciona todos os funcionários uma única vez.
     selecionar_funcionarios(dados)
@@ -767,7 +981,7 @@ def main():
     # No modo --mat, identifica o servidor selecionado
     # e direciona os PDFs para a pasta individual dele.
     if args.mat:
-        janela = aguardar_janela(TITULO_JANELA_PRINCIPAL)
+        janela = exigir_janela(TITULO_JANELA_PRINCIPAL)
         janela.set_focus()
         nome_funcionario = obter_nome_funcionario(janela)
 
@@ -795,13 +1009,21 @@ def main():
         print(f"INICIANDO LANÇAMENTO {codigo_lancamento}")
         print("#" * 60)
 
-        processar_anos(
-            pasta_saida,
-            inicio_ano,
-            fim_ano,
-            codigo_lancamento,
-            "",
-        )
+        with medir(f"TOTAL lançamento {codigo_lancamento}"):
+            processar_anos(
+                pasta_saida,
+                inicio_ano,
+                fim_ano,
+                codigo_lancamento,
+            )
+
+    tempo_total = time.perf_counter() - inicio_execucao
+
+    print("\n" + "=" * 60)
+    print(f" TEMPO TOTAL DE EXECUÇÃO: {tempo_total:.2f} segundos")
+    print("=" * 60)
+
+    imprimir_relatorio_tempos()
 
 
 if __name__ == "__main__":
