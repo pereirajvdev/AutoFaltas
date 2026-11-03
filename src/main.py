@@ -4,22 +4,32 @@ import argparse
 import time
 from pathlib import Path
 
-import pandas as pd
-import pyperclip
-
 from pywinauto import Desktop
 from pywinauto import mouse
 
+import pandas as pd
+import pyperclip
 
-TITULO_JANELA = (
+
+TITULO_JANELA_PRINCIPAL = (
     "Gerador de Relatórios "
     "( Versão: 4.0 ) - Recursos Humanos e Folha de Pagamento"
 )
+
+TITULO_LANCAMENTOS_ESPECIFICOS = "Lancamentos_Especificos__por_Ano"
+
+TITULO_IMPRIMIR = "Imprimir"
+
+TITULO_SOBRESCREVER = "Confirmar Salvar como"
+
+TITULO_SAIDA_IMPRESSAO = "Salvar saída de impressão como"
 
 DIRETORIO_SERVIDORES = Path(
     r"C:\Users\Joao Castro\Desktop\JOAO\Servidores"
 )
 
+TEMPO_LIMITE = 60
+INTERVALO_VERIFICACAO = 0.3
 
 def ler_planilha(caminho):
     df = pd.read_excel(caminho)
@@ -56,7 +66,7 @@ def ler_planilha(caminho):
 def obter_janela():
     desktop = Desktop(backend="win32")
 
-    janela = desktop.window(title=TITULO_JANELA)
+    janela = desktop.window(title=TITULO_JANELA_PRINCIPAL)
 
     if not janela.exists(timeout=5):
         raise RuntimeError(
@@ -139,7 +149,8 @@ def encontrar_campo_lancamento(janela):
 
 
 def preencher_matricula(matricula):
-    janela = obter_janela()
+    janela = aguardar_janela(TITULO_JANELA_PRINCIPAL)
+    janela.set_focus()
 
     controle = encontrar_campo_funcionario(janela)
 
@@ -246,11 +257,11 @@ def get_screen_name():
             titulo = janela.window_text()
             classe = janela.class_name()
 
-            if titulo == TITULO_JANELA:
+            if titulo == TITULO_JANELA_PRINCIPAL:
                 return "Gerador"
 
             if (
-                titulo == "Lancamentos_Especificos__por_Ano"
+                titulo == TITULO_LANCAMENTOS_ESPECIFICOS
                 and classe == "TfrmPreview"
             ):
                 return "Preview"
@@ -270,82 +281,30 @@ def processar_resultado(
 ):
     print("Aguardando resultado...")
 
-    inicio = time.monotonic()
-    timeout = 120
+    clicar_botao_preview()
 
-    while time.monotonic() - inicio < timeout:
-        tela_atual = get_screen_name()
-
-        if tela_atual == "Preview":
-            print("Relatório aberto no preview.")
-
-            preview = None
-            desktop = Desktop(backend="win32")
-
-            try:
-                for janela in desktop.windows():
-                    try:
-                        if (
-                            janela.window_text()
-                            == "Lancamentos_Especificos__por_Ano"
-                            and janela.class_name() == "TfrmPreview"
-                        ):
-                            preview = janela
-                            break
-                    except Exception:
-                        continue
-
-            except Exception as erro:
-                print(
-                    "[AVISO] Falha ao localizar o preview: "
-                    f"{erro}"
-                )
-
-            clicar_botao_preview()
-
-            salvo = imprimir_como_pdf(
-                nome_funcionario,
-                ano,
-                codigo_lancamento,
-                pasta_saida,
-            )
-
-            if salvo:
-                print("Fechando preview...")
-
-                if preview is not None:
-                    try:
-                        if preview.is_valid():
-                            preview.close()
-                            time.sleep(0.5)
-
-                    except Exception as erro:
-                        print(
-                            "[AVISO] Não foi possível fechar "
-                            f"o preview normalmente: {erro}"
-                        )
-
-                # Tenta localizar novamente, pois o handle
-                # anterior pode ter deixado de ser válido.
-                fechar_preview()
-
-                return True
-
-            print(
-                "[ERRO] A impressão não foi concluída "
-                "com sucesso."
-            )
-            return False
-
-        time.sleep(0.2)
-
-    raise TimeoutError(
-        f"O relatório da matrícula/ano {ano} "
-        f"não apareceu no preview em {timeout} segundos."
+    salvo = imprimir_como_pdf(
+        nome_funcionario,
+        ano,
+        codigo_lancamento,
+        pasta_saida,
     )
+
+    if salvo:
+        janela = aguardar_janela(TITULO_LANCAMENTOS_ESPECIFICOS)
+        janela.set_focus()
+
+        fechar_preview()
+
+        return True
+    
+    return False
 
 
 def clicar_botao_preview():
+    janela = aguardar_janela(TITULO_LANCAMENTOS_ESPECIFICOS)
+    janela.set_focus()
+
     x = 306
     y = 39
 
@@ -355,6 +314,8 @@ def clicar_botao_preview():
 
     print("Botão clicado.")
 
+    time.sleep(.5)
+
 
 def imprimir_como_pdf(
     nome_funcionario,
@@ -362,32 +323,20 @@ def imprimir_como_pdf(
     codigo_lancamento,
     pasta_saida,
 ):
-    desktop = Desktop(backend="win32")
+    janela = aguardar_janela(TITULO_IMPRIMIR, TITULO_LANCAMENTOS_ESPECIFICOS)
+    while janela.window_text() == TITULO_LANCAMENTOS_ESPECIFICOS:
+        janela.set_focus()
+        print(f"foco setado novamente em {TITULO_LANCAMENTOS_ESPECIFICOS}"
+              "\nClicando em preview novamente")
 
-    print("Aguardando janela de impressão...")
-
-    janela = None
-
-    while janela is None:
-        janelas = desktop.windows(
-            class_name="TfrPrintForm"
-        )
-
-        for item in janelas:
-            try:
-                if item.is_visible():
-                    janela = item
-                    break
-            except Exception:
-                pass
-
-        if janela is None:
-            time.sleep(0.2)
-
+        clicar_botao_preview()
+    janela.set_focus()
+    
     print("Janela de impressão encontrada.")
-    print("Handle:", janela.handle)
 
     combo_impressora = None
+
+    time.sleep(.5)
 
     for controle in janela.descendants():
         try:
@@ -402,7 +351,7 @@ def imprimir_como_pdf(
 
         except Exception:
             pass
-
+        
     if combo_impressora is None:
         print("ComboBox da impressora não encontrada.")
         return False
@@ -439,7 +388,7 @@ def imprimir_como_pdf(
     print("Clicando em OK da impressão...")
 
     botao_ok.click()
-
+    
     return salvar_pdf(
         nome_funcionario,
         ano,
@@ -454,29 +403,8 @@ def salvar_pdf(
     codigo_lancamento,
     pasta_saida,
 ):
-    desktop = Desktop(backend="win32")
-
-    print("Aguardando janela para salvar PDF...")
-
-    janela = None
-
-    while janela is None:
-        for item in desktop.windows():
-            try:
-                if (
-                    item.is_visible()
-                    and item.class_name() == "#32770"
-                ):
-                    janela = item
-                    break
-            except Exception:
-                pass
-
-        if janela is None:
-            time.sleep(0.2)
-
-    print("Janela de salvamento encontrada.")
-    print("Título:", janela.window_text())
+    janela = aguardar_janela(TITULO_SAIDA_IMPRESSAO)
+    janela.set_focus()
 
     pasta_saida.mkdir(parents=True, exist_ok=True)
 
@@ -530,7 +458,11 @@ def salvar_pdf(
 
     print("Comando de salvar enviado.")
 
-    confirmar_sobrescrita_pdf()
+    janela = aguardar_janela(TITULO_SOBRESCREVER, TITULO_JANELA_PRINCIPAL)
+    janela.set_focus()
+
+    if janela.window_text() == TITULO_SOBRESCREVER:
+        confirmar_sobrescrita_pdf(janela)
 
     time.sleep(0.5)
 
@@ -538,6 +470,8 @@ def salvar_pdf(
         print("PDF salvo:", caminho_pdf)
         return True
 
+    input("continuar...")
+    
     print("PDF não encontrado após salvar:", caminho_pdf)
     return False
 
@@ -555,7 +489,7 @@ def fechar_preview():
         try:
             if (
                 janela.window_text()
-                == "Lancamentos_Especificos__por_Ano"
+                == TITULO_LANCAMENTOS_ESPECIFICOS
                 and janela.class_name() == "TfrmPreview"
             ):
                 print(
@@ -738,35 +672,18 @@ def obter_nome_funcionario(janela):
     return None
 
 
-def confirmar_sobrescrita_pdf():
+def confirmar_sobrescrita_pdf(janela):
     print("Verificando confirmação de sobrescrita...")
 
     time.sleep(0.5)
+    
+    janela.type_keys("{LEFT}")
 
-    desktop = Desktop(backend="win32")
+    time.sleep(0.2)
+    
+    janela.type_keys("{ENTER}")
 
-    for janela in desktop.windows():
-        try:
-            if (
-                janela.is_visible()
-                and janela.class_name() == "#32770"
-                and "confirmar" in janela.window_text().lower()
-            ):
-                janela.set_focus()
-                janela.type_keys("{LEFT}")
-                time.sleep(0.2)
-                janela.type_keys("{ENTER}")
-
-                print("Confirmação de sobrescrita enviada.")
-                time.sleep(0.5)
-
-                return True
-
-        except Exception:
-            continue
-
-    print("Janela de confirmação não encontrada.")
-    return False
+    print("Confirmação de sobrescrita enviada.")
 
 
 def obter_pasta_servidor(nome_funcionario):
@@ -777,6 +694,86 @@ def obter_pasta_servidor(nome_funcionario):
         raise ValueError("O nome do servidor está vazio.")
 
     return DIRETORIO_SERVIDORES / nome
+
+
+def localizar_janela(titulo_esperado):
+    """
+    Localiza uma janela pelo título ou por um trecho dele.
+    Retorna um objeto pywinauto ou None.
+    """
+    for janela in Desktop(backend="win32").windows():
+        try:
+            titulo = janela.window_text().strip()
+
+            if titulo_esperado.casefold() in titulo.casefold():
+                print(f"[OK] Janela identificada: {titulo}")
+                return janela
+
+        except Exception:
+            continue
+
+    return None
+
+
+def aguardar_janela(*titulos_esperados, time_limit=TEMPO_LIMITE):
+    """
+    Aguarda até que uma janela com um dos títulos informados apareça.
+
+    Args:
+        *titulos_esperados: Um ou mais títulos de janelas.
+        time_limit: Tempo máximo de espera, em segundos.
+
+    Returns:
+        Objeto pywinauto da primeira janela válida encontrada ou None.
+    """
+    print(
+        f"[INFO] Aguardando uma das janelas: "
+        f"{', '.join(titulos_esperados)}"
+    )
+
+    limite = time.monotonic() + time_limit
+
+    while time.monotonic() < limite:
+        for titulo_esperado in titulos_esperados:
+            janela = localizar_janela(titulo_esperado)
+
+            if janela is None:
+                continue
+
+            try:
+                titulo_real = janela.window_text().strip()
+
+                if "Não está respondendo" in titulo_real:
+                    print(
+                        f"[AGUARDANDO] Janela sem resposta: "
+                        f"{titulo_real}"
+                    )
+                    continue
+
+                a = "Não está respondendo" not in titulo_real
+
+                print(
+                    f"Esse eh o titulo: {titulo_real} "
+                    f"|| verificação {a}"
+                )
+
+                return janela
+
+            except Exception as erro:
+                print(
+                    f"[AVISO] Erro ao verificar o título da janela: "
+                    f"{erro}"
+                )
+
+        time.sleep(INTERVALO_VERIFICACAO)
+
+    print(
+        f"[INFO] Nenhuma janela válida apareceu em "
+        f"{time_limit} segundos: "
+        f"{', '.join(titulos_esperados)}"
+    )
+
+    return None
 
 
 def main():
